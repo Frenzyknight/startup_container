@@ -73,6 +73,7 @@ install_system_deps() {
         curl \
         wget \
         unzip \
+        lsof \
         python3-pip \
         python3-dev \
         build-essential \
@@ -176,20 +177,14 @@ configure_vllm() {
 start_server() {
     print_status "Starting vLLM server..."
 
-    # Check if port is already in use
-    if lsof -Pi :${PORT} -sTCP:LISTEN -t >/dev/null ; then
-        print_warning "Port ${PORT} is already in use"
-        print_status "Attempting to stop existing server..."
-        pkill -f "vllm serve" || true
-        sleep 5
-    fi
-
     print_status "Launching vLLM server with DotsOCR model..."
     print_status "Model path: ${MODEL_PATH}"
     print_status "Host: ${HOST}:${PORT}"
     print_status "Model name: ${MODEL_NAME}"
 
-    # Start vLLM server
+    # Start vLLM server and capture logs
+    print_status "Starting vLLM server... This may take several minutes for model loading and compilation."
+
     CUDA_VISIBLE_DEVICES=0 vllm serve "${MODEL_PATH}" \
         --tensor-parallel-size 1 \
         --gpu-memory-utilization 0.95 \
@@ -198,32 +193,101 @@ start_server() {
         --trust-remote-code \
         --host "${HOST}" \
         --port "${PORT}" \
-        --max-model-len 20000 &
+        --max-model-len 20000 2>&1 | tee /tmp/vllm.log &
 
     SERVER_PID=$!
 
-    # Wait for server to start
-    print_status "Waiting for server to start..."
-    sleep 10
+    # Monitor logs for initialization completion
+    print_status "Monitoring server initialization... (this may take 5-10 minutes)"
+    print_status "Waiting for model loading and compilation to complete..."
 
-    # Check if server is running
-    for i in {1..30}; do
-        if curl -s "http://${HOST}:${PORT}/health" > /dev/null; then
-            print_success "vLLM server started successfully!"
-            print_success "Server is running at http://${HOST}:${PORT}"
-            print_success "Model name: ${MODEL_NAME}"
-            print_success "Health endpoint: http://${HOST}:${PORT}/health"
+    # Wait for specific log messages that indicate server is ready
+    timeout=600  # 10 minutes timeout
+    elapsed=0
+    check_interval=5
+
+    while [ $elapsed -lt $timeout ]; do
+        if [ ! -f /tmp/vllm.log ]; then
+            sleep 1
+            elapsed=$((elapsed + 1))
+            continue
+        fi
+
+        # Check for completion indicators in logs
+        if grep -q "Uvicorn running on" /tmp/vllm.log || \
+           grep -q "Application startup complete" /tmp/vllm.log || \
+           grep -q "Started server process" /tmp/vllm.log; then
+            print_status "Server initialization detected in logs!"
             break
         fi
 
-        if [ $i -eq 30 ]; then
-            print_error "Server failed to start within timeout"
+        # Check if server process is still running
+        if ! kill -0 $SERVER_PID 2>/dev/null; then
+            print_error "Server process died during startup"
+            tail -20 /tmp/vllm.log
             exit 1
         fi
 
-        print_status "Waiting for server... (${i}/30)"
-        sleep 2
+        # Show progress based on log content
+        if grep -q "Loading weights took" /tmp/vllm.log; then
+            print_status "✓ Model weights loaded successfully"
+        fi
+
+        if grep -q "Model loading took" /tmp/vllm.log; then
+            print_status "✓ Model loading completed"
+        fi
+
+        if grep -q "Compiling a graph" /tmp/vllm.log; then
+            print_status "⏳ Model compilation in progress..."
+        fi
+
+        sleep $check_interval
+        elapsed=$((elapsed + check_interval))
+
+        # Show elapsed time every 30 seconds
+        if [ $((elapsed % 30)) -eq 0 ]; then
+            print_status "Elapsed time: ${elapsed}s (waiting for server to be ready...)"
+        fi
     done
+
+    if [ $elapsed -ge $timeout ]; then
+        print_warning "Timeout reached, but checking if server is responsive..."
+    fi
+
+    # Now check if server is actually responsive
+    print_status "Checking server health endpoint..."
+    health_timeout=60  # 1 minute for health checks
+    health_elapsed=0
+
+    while [ $health_elapsed -lt $health_timeout ]; do
+        if curl -s "http://${HOST}:${PORT}/health" > /dev/null 2>&1; then
+            print_success "✅ vLLM server started successfully!"
+            print_success "Server is running at http://${HOST}:${PORT}"
+            print_success "Model name: ${MODEL_NAME}"
+            print_success "Health endpoint: http://${HOST}:${PORT}/health"
+            return 0
+        fi
+
+        # Check if server process is still running
+        if ! kill -0 $SERVER_PID 2>/dev/null; then
+            print_error "Server process died"
+            print_error "Last few lines of server log:"
+            tail -20 /tmp/vllm.log
+            exit 1
+        fi
+
+        sleep 5
+        health_elapsed=$((health_elapsed + 5))
+
+        if [ $((health_elapsed % 15)) -eq 0 ]; then
+            print_status "Health check attempt $((health_elapsed/5))/12..."
+        fi
+    done
+
+    print_error "Server failed to respond to health checks within timeout"
+    print_error "Server process is running but not responding. Check logs:"
+    print_error "tail -f /tmp/vllm.log"
+    exit 1
 }
 
 # Function to cleanup on exit
