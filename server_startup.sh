@@ -1,6 +1,5 @@
 #!/bin/bash
 
-apt-get update && apt-get install -y git curl wget unzip
 pip install vllm==0.9.1
 cd /workspace
 git clone https://github.com/rednote-hilab/dots.ocr.git dots-ocr
