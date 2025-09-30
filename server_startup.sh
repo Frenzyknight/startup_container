@@ -21,4 +21,4 @@ vllm serve /workspace/dots-ocr/weights/DotsOCR \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000 \
-    --max-model-len 20000
+    --max-model-len 40000
